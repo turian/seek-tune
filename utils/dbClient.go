@@ -1,116 +1,79 @@
 package utils
 
 import (
-	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"song-recognition/models"
 	"strings"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/primitive"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	_ "github.com/mattn/go-sqlite3"
 )
 
-// godotenv.Load(".env")
-
-var (
-	dbUsername = GetEnv("DB_USER")
-	dbPassword = GetEnv("DB_PASS")
-	dbName     = GetEnv("DB_NAME")
-	dbHost     = GetEnv("DB_HOST")
-	dbPort     = GetEnv("DB_PORT")
-
-	dbUri = "mongodb://" + dbUsername + ":" + dbPassword + "@" + dbHost + ":" + dbPort + "/" + dbName
-)
-
-// DbClient represents a MongoDB client
+// DbClient represents an SQLite client
 type DbClient struct {
-	client *mongo.Client
+	db *sql.DB
 }
 
 // NewDbClient creates a new instance of DbClient
 func NewDbClient() (*DbClient, error) {
-	if dbUsername == "" || dbPassword == "" {
-		dbUri = "mongodb://localhost:27017"
+	db, err := sql.Open("sqlite3", "./song_recognition.db")
+	if err != nil {
+		return nil, fmt.Errorf("error connecting to SQLite: %v", err)
 	}
 
-	clientOptions := options.Client().ApplyURI(dbUri)
-	client, err := mongo.Connect(context.Background(), clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("error connecting to MongoDB: %d", err)
-	}
-	return &DbClient{client: client}, nil
+	return &DbClient{db: db}, nil
 }
 
-// Close closes the underlying MongoDB client
+// Close closes the underlying SQLite connection
 func (db *DbClient) Close() error {
-	if db.client != nil {
-		return db.client.Disconnect(context.Background())
+	if db.db != nil {
+		return db.db.Close()
 	}
 	return nil
 }
 
 func (db *DbClient) StoreFingerprints(fingerprints map[uint32]models.Couple) error {
-	collection := db.client.Database("song-recognition").Collection("fingerprints")
+	tx, err := db.db.Begin()
+	if err != nil {
+		return err
+	}
 
 	for address, couple := range fingerprints {
-		filter := bson.M{"_id": address}
-		update := bson.M{
-			"$push": bson.M{
-				"couples": bson.M{
-					"anchorTimeMs": couple.AnchorTimeMs,
-					"songID":       couple.SongID,
-				},
-			},
-		}
-		opts := options.Update().SetUpsert(true)
-
-		_, err := collection.UpdateOne(context.Background(), filter, update, opts)
+		_, err := tx.Exec(`
+			INSERT INTO fingerprints (address, anchorTimeMs, songID)
+			VALUES (?, ?, ?)
+			ON CONFLICT(address) DO UPDATE SET anchorTimeMs = excluded.anchorTimeMs, songID = excluded.songID`,
+			address, couple.AnchorTimeMs, couple.SongID)
 		if err != nil {
-			return fmt.Errorf("error upserting document: %s", err)
+			tx.Rollback()
+			return fmt.Errorf("error inserting/updating fingerprint: %v", err)
 		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (db *DbClient) GetCouples(addresses []uint32) (map[uint32][]models.Couple, error) {
-	collection := db.client.Database("song-recognition").Collection("fingerprints")
-
 	couples := make(map[uint32][]models.Couple)
 
 	for _, address := range addresses {
-		// Find the document corresponding to the address
-		var result bson.M
-		err := collection.FindOne(context.Background(), bson.M{"_id": address}).Decode(&result)
+		rows, err := db.db.Query(`
+			SELECT anchorTimeMs, songID FROM fingerprints WHERE address = ?`, address)
 		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				continue
-			}
-			return nil, fmt.Errorf("error retrieving document for address %d: %s", address, err)
+			return nil, fmt.Errorf("error querying fingerprints: %v", err)
 		}
+		defer rows.Close()
 
-		// Extract couples from the document and append them to the couples map
 		var docCouples []models.Couple
-		couplesList, ok := result["couples"].(primitive.A)
-		if !ok {
-			return nil, fmt.Errorf("couples field in document for address %d is not valid", address)
-		}
-
-		for _, item := range couplesList {
-			itemMap, ok := item.(primitive.M)
-			if !ok {
-				return nil, fmt.Errorf("invalid couple format in document for address %d", address)
-			}
-
-			couple := models.Couple{
-				AnchorTimeMs: uint32(itemMap["anchorTimeMs"].(int64)),
-				SongID:       uint32(itemMap["songID"].(int64)),
+		for rows.Next() {
+			var couple models.Couple
+			if err := rows.Scan(&couple.AnchorTimeMs, &couple.SongID); err != nil {
+				return nil, fmt.Errorf("error scanning couple: %v", err)
 			}
 			docCouples = append(docCouples, couple)
 		}
+
 		couples[address] = docCouples
 	}
 
@@ -118,38 +81,25 @@ func (db *DbClient) GetCouples(addresses []uint32) (map[uint32][]models.Couple, 
 }
 
 func (db *DbClient) TotalSongs() (int, error) {
-	existingSongsCollection := db.client.Database("song-recognition").Collection("songs")
-	total, err := existingSongsCollection.CountDocuments(context.Background(), bson.D{})
+	var count int
+	err := db.db.QueryRow(`SELECT COUNT(*) FROM songs`).Scan(&count)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("error counting songs: %v", err)
 	}
-
-	return int(total), nil
+	return count, nil
 }
 
 func (db *DbClient) RegisterSong(songTitle, songArtist, ytID string) (uint32, error) {
-	existingSongsCollection := db.client.Database("song-recognition").Collection("songs")
-
-	// Create a compound unique index on ytID and key, if it doesn't already exist
-	indexModel := mongo.IndexModel{
-		Keys:    bson.D{{"ytID", 1}, {"key", 1}},
-		Options: options.Index().SetUnique(true),
-	}
-	_, err := existingSongsCollection.Indexes().CreateOne(context.Background(), indexModel)
-	if err != nil {
-		return 0, fmt.Errorf("failed to create unique index: %v", err)
-	}
-
-	// Attempt to insert the song with ytID and key
 	songID := GenerateUniqueID()
 	key := GenerateSongKey(songTitle, songArtist)
-	_, err = existingSongsCollection.InsertOne(context.Background(), bson.M{"_id": songID, "key": key, "ytID": ytID})
+
+	_, err := db.db.Exec(`
+		INSERT INTO songs (id, title, artist, ytID, key)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(key) DO NOTHING`,
+		songID, songTitle, songArtist, ytID, key)
 	if err != nil {
-		if mongo.IsDuplicateKeyError(err) {
-			return 0, fmt.Errorf("song with ytID or key already exists: %v", err)
-		} else {
-			return 0, fmt.Errorf("failed to register song: %v", err)
-		}
+		return 0, fmt.Errorf("failed to register song: %v", err)
 	}
 
 	return songID, nil
@@ -161,37 +111,30 @@ type Song struct {
 	YouTubeID string
 }
 
-const FILTER_KEYS = "_id | ytID | key"
+const FILTER_KEYS = "id | ytID | key"
 
 func (db *DbClient) GetSong(filterKey string, value interface{}) (s Song, songExists bool, e error) {
 	if !strings.Contains(FILTER_KEYS, filterKey) {
 		return Song{}, false, errors.New("invalid filter key")
 	}
 
-	songsCollection := db.client.Database("song-recognition").Collection("songs")
-	var song bson.M
+	query := fmt.Sprintf("SELECT title, artist, ytID FROM songs WHERE %s = ?", filterKey)
+	row := db.db.QueryRow(query, value)
 
-	filter := bson.M{filterKey: value}
-
-	err := songsCollection.FindOne(context.Background(), filter).Decode(&song)
+	var song Song
+	err := row.Scan(&song.Title, &song.Artist, &song.YouTubeID)
 	if err != nil {
-		if err == mongo.ErrNoDocuments {
+		if err == sql.ErrNoRows {
 			return Song{}, false, nil
 		}
 		return Song{}, false, fmt.Errorf("failed to retrieve song: %v", err)
 	}
 
-	ytID := song["ytID"].(string)
-	title := strings.Split(song["key"].(string), "---")[0]
-	artist := strings.Split(song["key"].(string), "---")[1]
-
-	songInstance := Song{title, artist, ytID}
-
-	return songInstance, true, nil
+	return song, true, nil
 }
 
 func (db *DbClient) GetSongByID(songID uint32) (Song, bool, error) {
-	return db.GetSong("_id", songID)
+	return db.GetSong("id", songID)
 }
 
 func (db *DbClient) GetSongByYTID(ytID string) (Song, bool, error) {
@@ -203,23 +146,17 @@ func (db *DbClient) GetSongByKey(key string) (Song, bool, error) {
 }
 
 func (db *DbClient) DeleteSongByID(songID uint32) error {
-	songsCollection := db.client.Database("song-recognition").Collection("songs")
-
-	filter := bson.M{"_id": songID}
-
-	_, err := songsCollection.DeleteOne(context.Background(), filter)
+	_, err := db.db.Exec(`DELETE FROM songs WHERE id = ?`, songID)
 	if err != nil {
 		return fmt.Errorf("failed to delete song: %v", err)
 	}
-
 	return nil
 }
 
-func (db *DbClient) DeleteCollection(collectionName string) error {
-	collection := db.client.Database("song-recognition").Collection(collectionName)
-	err := collection.Drop(context.Background())
+func (db *DbClient) DeleteCollection(tableName string) error {
+	_, err := db.db.Exec(fmt.Sprintf(`DELETE FROM %s`, tableName))
 	if err != nil {
-		return fmt.Errorf("error deleting collection: %v", err)
+		return fmt.Errorf("error deleting table: %v", err)
 	}
 	return nil
 }

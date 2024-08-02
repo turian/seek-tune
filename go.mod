@@ -10,7 +10,7 @@ require (
 	github.com/mdobak/go-xerrors v0.3.1
 	github.com/stretchr/testify v1.9.0
 	github.com/tidwall/gjson v1.17.1
-	go.mongodb.org/mongo-driver v1.14.0
+	github.com/mattn/go-sqlite3 v1.14.13
 	gonum.org/v1/gonum v0.14.0
 	google.golang.org/api v0.166.0
 )
